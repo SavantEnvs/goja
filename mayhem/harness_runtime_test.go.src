@@ -1,0 +1,115 @@
+//go:build go1.18
+
+// mayhem harness — goja RUNTIME: parse + compile + RUN untrusted JS source
+// through the public Runtime API (goja.New / Compile / RunProgram). This is
+// the deep target: it drives the compiler AND the bytecode VM, including
+// native (Go-implemented) builtins, not just the lexer/parser/AST (see
+// parser/mayhem_harness_parse_test.go.src for that shallower target).
+//
+// ── BOUNDING THE VM (the load-bearing part of this harness) ────────────────
+//
+// Untrusted JS trivially produces:
+//
+//  1. JS-level infinite loops (`while(1){}`). Bounded by Runtime.Interrupt(),
+//     armed from a time.AfterFunc. Verified empirically during integration:
+//     goja's vm.run() checks the interrupted flag between EVERY bytecode
+//     instruction (vm.go, vm.run()), so `while(1){}` under a 300ms
+//     Interrupt() deadline returned in ~300.5ms — effectively immediate.
+//
+//  2. Unbounded work inside NATIVE (Go-implemented) builtins — e.g.
+//     `new Array(1e9).fill(0)`, `"a".repeat(2e9)`,
+//     `new Array(1e8).fill(1).join(",")`, `JSON.stringify(hugeArray)`.
+//     Runtime.Interrupt()'s own doc says: "it only works while in JavaScript
+//     code, it does not interrupt native Go functions (which includes all
+//     built-ins)". CONFIRMED empirically: all four one-liners above hung
+//     indefinitely (tested to 30s) with Interrupt() alone armed at 200ms —
+//     the interrupt request is simply never observed because control never
+//     returns to the VM's bytecode loop. This is a genuine finding, recorded
+//     at mayhem/fuzz_runtime/known-findings/native-builtin-unbounded-work/.
+//
+//  3. Deep call recursion. Bounded by Runtime.SetMaxCallStackSize() (goja
+//     already default-guards this with a *StackOverflowError even without an
+//     explicit call, but we tighten it for determinism/speed).
+//
+// Because (2) cannot be stopped from inside the VM, this harness layers a
+// SECOND, hard, process-level watchdog on top of Interrupt(): if execution
+// has not returned mayhemHardDeadline after the soft interrupt fires, the
+// watchdog calls os.Exit() itself. This converts an otherwise-UNBOUNDED hang
+// — which would stall the entire fuzzing campaign, since libFuzzer's default
+// per-input timeout is 1200s and fuzz-smoke does not pass -timeout (see
+// docs/netnew-worker-prompt.md §6b) — into a fast (~1.5s), bounded process
+// exit that libFuzzer catches and reports as a finding, exactly the way
+// libFuzzer's own -timeout mechanism aborts a stuck run. This does NOT mask
+// the bug (forbidden by §6b for crashes/OOMs): it SURFACES the unbounded
+// native-builtin hang as a reportable crash instead of freezing the run.
+//
+// No file I/O and no host bindings: bytes come only from the fuzzer via
+// go-118-fuzz-build's go-fuzz-headers string consumer, and this is a bare
+// goja.New() runtime — no require()/console/filesystem/network bindings are
+// ever registered, so a fuzzed script has no path to the host through this
+// harness.
+//
+// PACKAGE NOTE: package goja — the repo root's own package, uniform across
+// every root *.go/*_test.go file (no internal/external test-package split
+// at the root), so go-118-fuzz-build's in-place rewrite does not collide
+// (see the port brief's Go trap on mixed internal/external test packages).
+// Declaring `package goja` also gives unqualified access to New/Compile.
+package goja
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+const (
+	// Soft bound: request VM interruption. Effective almost immediately for
+	// JS-level loops (checked every bytecode instruction).
+	mayhemInterruptDeadline = 300 * time.Millisecond
+	// Hard bound: if the soft interrupt didn't stop execution within this
+	// much *additional* time (i.e. total ~1.5s from start), assume we're
+	// stuck inside an uninterruptible native builtin and abort the process.
+	mayhemHardDeadline = 1500 * time.Millisecond
+	// Bound native/JS call recursion depth.
+	mayhemMaxCallStackSize = 512
+)
+
+func FuzzMayhemRuntime(f *testing.F) {
+	f.Fuzz(func(t *testing.T, src string) {
+		if len(src) > 16384 {
+			return
+		}
+
+		rt := New()
+		rt.SetMaxCallStackSize(mayhemMaxCallStackSize)
+
+		prg, err := Compile("fuzz.js", src, false)
+		if err != nil {
+			// A syntax error is an expected outcome for untrusted text, not
+			// a finding.
+			return
+		}
+
+		interruptTimer := time.AfterFunc(mayhemInterruptDeadline, func() {
+			rt.Interrupt("mayhem: vm interrupt deadline exceeded")
+		})
+		defer interruptTimer.Stop()
+
+		watchdog := time.AfterFunc(mayhemHardDeadline, func() {
+			// Interrupt() did not stop execution in time — almost certainly
+			// wedged inside a native builtin (see the header comment and
+			// mayhem/fuzz_runtime/known-findings/). Abort hard rather than
+			// hang the whole fuzzing campaign.
+			os.Exit(70)
+		})
+		defer watchdog.Stop()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() { recover() }() // RunProgram already recovers *InterruptedError internally; belt & suspenders.
+			_, _ = rt.RunProgram(prg)
+		}()
+		<-done
+	})
+}

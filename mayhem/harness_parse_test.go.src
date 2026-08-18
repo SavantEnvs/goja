@@ -1,0 +1,48 @@
+//go:build go1.18
+
+// mayhem harness — goja PARSER surface only: lexer -> parser -> AST via the
+// public parser.ParseFile API. No compilation and no execution — this is the
+// "compile an attacker-supplied JS source" threat model in isolation. See
+// harness_runtime_test.go.src (in the repo root) for the deeper
+// parse+compile+RUN target that also drives the bytecode VM.
+//
+// No file I/O: the source text comes only from the fuzzer. Seeds are wired
+// via the Mayhemfile testsuite: directive (docs/seed-corpus.md), sampled
+// from the tc39/test262 suite (goja's own oracle for correctness, but not
+// vendored in this repo — testdata/test262 is fetched on demand by
+// .tc39_test262_checkout.sh and absent by default, so TestTC39 self-skips
+// when it's missing; go test ./... still runs goja's ~900 non-tc39 Test*
+// functions unconditionally).
+//
+// BOUNDING: pure lexing/parsing/AST-construction is bounded by input size —
+// no execution and (confirmed by reading parser/regexp.go) no regexp2
+// compilation happens at parse time, only pattern-syntax translation — so no
+// watchdog is needed for this target (unlike harness_runtime_test.go.src).
+// The length cap below just keeps iteration throughput high.
+//
+// PACKAGE NOTE: package parser — this directory's own package, uniform
+// across every parser/*.go and parser/*_test.go file (no internal/external
+// test-package split here), so go-118-fuzz-build's in-place rewrite to a
+// non-test source file does not collide (see the port brief's Go trap on
+// mixed internal/external test packages).
+package parser
+
+import (
+	"testing"
+)
+
+func FuzzMayhemParse(f *testing.F) {
+	f.Fuzz(func(t *testing.T, src string) {
+		// A pathologically long source mostly burns CPU in the scanner
+		// without adding meaningful coverage; keep the fuzzer's iteration
+		// rate high.
+		if len(src) > 16384 {
+			return
+		}
+		// A nil *file.FileSet is the standard usage here -- every internal
+		// caller (runtime.go's compile(), parser's own doc example) passes
+		// nil too; a FileSet is only needed when the caller wants
+		// file/line position lookups later.
+		_, _ = ParseFile(nil, "fuzz.js", src, 0)
+	})
+}

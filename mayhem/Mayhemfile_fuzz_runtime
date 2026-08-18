@@ -1,0 +1,8 @@
+project: savantenvs/goja
+target: fuzz_runtime
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz_runtime/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_runtime
+    libfuzzer: true
