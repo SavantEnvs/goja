@@ -1,0 +1,57 @@
+//go:build go1.18
+
+// mayhem harness — goja RUNTIME: parse + compile + RUN untrusted JS source
+// through the public Runtime API (goja.New / Compile / RunProgram). This is
+// the deep target: it drives the compiler AND the bytecode VM, including
+// native (Go-implemented) builtins, not just the lexer/parser/AST (see
+// parser/mayhem_harness_parse_test.go.src for that shallower target).
+//
+// ── NO TIMERS ──────────────────────────────────────────────────────────────
+//
+// Untrusted JS can loop forever (`while(1){}`) or spend unbounded time inside
+// native builtins (`new Array(1e9).fill(0)`, `"a".repeat(2e9)`; see
+// mayhem/fuzz_runtime/known-findings/native-builtin-unbounded-work/). The
+// harness does not guard against either: no wall-clock Interrupt(), no
+// watchdog, no os.Exit. Mayhem owns the per-exec timeout (Mayhemfile
+// `timeout:`), and a hang is reported as a finding like a crash.
+//
+// The only bound kept is deterministic: Runtime.SetMaxCallStackSize() limits
+// call recursion depth, and inputs over 16 KiB are rejected.
+//
+// No file I/O and no host bindings: bytes come only from the fuzzer via
+// go-118-fuzz-build's go-fuzz-headers string consumer, and this is a bare
+// goja.New() runtime — no require()/console/filesystem/network bindings are
+// ever registered, so a fuzzed script has no path to the host through this
+// harness.
+//
+// PACKAGE NOTE: package goja — the repo root's own package, uniform across
+// every root *.go/*_test.go file (no internal/external test-package split
+// at the root), so go-118-fuzz-build's in-place rewrite does not collide
+// (see the port brief's Go trap on mixed internal/external test packages).
+// Declaring `package goja` also gives unqualified access to New/Compile.
+package goja
+
+import "testing"
+
+// Bound native/JS call recursion depth.
+const mayhemMaxCallStackSize = 512
+
+func FuzzMayhemRuntime(f *testing.F) {
+	f.Fuzz(func(t *testing.T, src string) {
+		if len(src) > 16384 {
+			return
+		}
+
+		rt := New()
+		rt.SetMaxCallStackSize(mayhemMaxCallStackSize)
+
+		prg, err := Compile("fuzz.js", src, false)
+		if err != nil {
+			// A syntax error is an expected outcome for untrusted text, not
+			// a finding.
+			return
+		}
+
+		_, _ = rt.RunProgram(prg)
+	})
+}
